@@ -1,0 +1,335 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, develop, '**' ]  # 在所有分支的 push 时运行
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: false
+        default: 'dev-build'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            python-version: '3.11'
+            executable-suffix: '.exe'
+            artifact-name: 'TimeNest-Windows-x64'
+          - os: macos-latest
+            platform: macos
+            arch: x64
+            python-version: '3.11'
+            executable-suffix: ''
+            artifact-name: 'TimeNest-macOS-x64'
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            python-version: '3.11'
+            executable-suffix: ''
+            artifact-name: 'TimeNest-Linux-x64'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    # Linux 系统依赖
+    - name: Install Linux dependencies
+      if: matrix.platform == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgl1-mesa-glx \
+          libglib2.0-0 \
+          libxkbcommon-x11-0 \
+          libxcb-icccm4 \
+          libxcb-image0 \
+          libxcb-keysyms1 \
+          libxcb-randr0 \
+          libxcb-render-util0 \
+          libxcb-xinerama0 \
+          libxcb-xfixes0 \
+          libegl1-mesa \
+          libxcb-cursor0
+
+    # macOS 系统依赖
+    - name: Install macOS dependencies
+      if: matrix.platform == 'macos'
+      run: |
+        # 安装必要的系统库
+        brew install create-dmg
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install nuitka>=1.8.0
+        pip install -r requirements.txt
+        # 安装额外的打包依赖
+        pip install ordered-set zstandard
+
+    # Windows 特定的依赖
+    - name: Install Windows build tools
+      if: matrix.platform == 'windows'
+      run: |
+        # 安装 Windows SDK 和 Visual Studio Build Tools（通过 chocolatey）
+        choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Workload.VCTools"
+
+    - name: Get version
+      id: get_version
+      shell: bash
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          VERSION="${{ github.event.inputs.version }}"
+        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION="dev-$(git rev-parse --short HEAD)"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Building version: $VERSION"
+
+    # Windows 打包
+    - name: Build with Nuitka (Windows)
+      if: matrix.platform == 'windows'
+      run: |
+        python -m nuitka \
+          --standalone \
+          --onefile \
+          --enable-plugin=pyqt6 \
+          --windows-console-mode=disable \
+          --windows-icon-from-ico=resources/icons/tray_icon.png \
+          --include-data-dir=resources=resources \
+          --include-package=core \
+          --include-package=ui \
+          --include-package=components \
+          --include-package=models \
+          --include-package=utils \
+          --include-package=sdk \
+          --assume-yes-for-downloads \
+          --output-filename=TimeNest-${{ steps.get_version.outputs.version }}-Windows-x64.exe \
+          main.py
+
+    # macOS 打包
+    - name: Build with Nuitka (macOS)
+      if: matrix.platform == 'macos'
+      run: |
+        python -m nuitka \
+          --standalone \
+          --onefile \
+          --enable-plugin=pyqt6 \
+          --macos-create-app-bundle \
+          --macos-app-icon=resources/icons/tray_icon.png \
+          --include-data-dir=resources=resources \
+          --include-package=core \
+          --include-package=ui \
+          --include-package=components \
+          --include-package=models \
+          --include-package=utils \
+          --include-package=sdk \
+          --assume-yes-for-downloads \
+          --output-filename=TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64 \
+          main.py
+
+    # Linux 打包
+    - name: Build with Nuitka (Linux)
+      if: matrix.platform == 'linux'
+      run: |
+        python -m nuitka \
+          --standalone \
+          --onefile \
+          --enable-plugin=pyqt6 \
+          --linux-icon=resources/icons/tray_icon.png \
+          --include-data-dir=resources=resources \
+          --include-package=core \
+          --include-package=ui \
+          --include-package=components \
+          --include-package=models \
+          --include-package=utils \
+          --include-package=sdk \
+          --assume-yes-for-downloads \
+          --output-filename=TimeNest-${{ steps.get_version.outputs.version }}-Linux-x64 \
+          main.py
+
+    # 创建 macOS DMG 包
+    - name: Create macOS DMG
+      if: matrix.platform == 'macos'
+      run: |
+        mkdir -p dist
+        # 如果生成了 .app 包，创建 DMG
+        if [ -d "main.app" ]; then
+          mv main.app "TimeNest.app"
+          create-dmg \
+            --volname "TimeNest" \
+            --window-pos 200 120 \
+            --window-size 600 300 \
+            --icon-size 100 \
+            --icon "TimeNest.app" 175 120 \
+            --hide-extension "TimeNest.app" \
+            --app-drop-link 425 120 \
+            "dist/TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64.dmg" \
+            "TimeNest.app"
+        else
+          # 如果是单文件，直接移动
+          mv TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64 dist/
+        fi
+
+    # 移动构建产物到 dist 目录
+    - name: Organize build artifacts
+      shell: bash
+      run: |
+        mkdir -p dist
+        
+        # Windows
+        if [ "${{ matrix.platform }}" == "windows" ]; then
+          mv TimeNest-${{ steps.get_version.outputs.version }}-Windows-x64.exe dist/
+        fi
+        
+        # Linux
+        if [ "${{ matrix.platform }}" == "linux" ]; then
+          mv TimeNest-${{ steps.get_version.outputs.version }}-Linux-x64 dist/
+          chmod +x dist/TimeNest-${{ steps.get_version.outputs.version }}-Linux-x64
+        fi
+        
+        # macOS (如果没有创建 DMG)
+        if [ "${{ matrix.platform }}" == "macos" ] && [ ! -f "dist/TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64.dmg" ]; then
+          if [ -f "TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64" ]; then
+            mv TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64 dist/
+            chmod +x dist/TimeNest-${{ steps.get_version.outputs.version }}-macOS-x64
+          fi
+        fi
+        
+        # 列出构建产物
+        echo "Build artifacts:"
+        ls -la dist/
+
+    # 上传构建产物
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.artifact-name }}-${{ steps.get_version.outputs.version }}
+        path: dist/
+        retention-days: 30
+
+  # 创建 Release（仅在推送标签时）
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get version
+      id: get_version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    # 下载所有构建产物
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: TimeNest-Windows-x64-${{ steps.get_version.outputs.version }}
+        path: ./artifacts/windows/
+
+    - name: Download macOS artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: TimeNest-macOS-x64-${{ steps.get_version.outputs.version }}
+        path: ./artifacts/macos/
+
+    - name: Download Linux artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: TimeNest-Linux-x64-${{ steps.get_version.outputs.version }}
+        path: ./artifacts/linux/
+
+    # 生成 Release Notes
+    - name: Generate Release Notes
+      id: release_notes
+      run: |
+        cat > release_notes.md << 'EOF'
+        ## TimeNest ${{ steps.get_version.outputs.version }}
+        
+        ### 📦 下载说明
+        
+        - **Windows 用户**: 下载 `TimeNest-*-Windows-x64.exe`
+        - **macOS 用户**: 下载 `TimeNest-*-macOS-x64.dmg` 或 `TimeNest-*-macOS-x64`
+        - **Linux 用户**: 下载 `TimeNest-*-Linux-x64`
+        
+        ### 🚀 新功能
+        
+        - 跨平台支持（Windows、macOS、Linux）
+        - 使用 Nuitka 编译，启动速度更快
+        - 单文件可执行程序，无需安装 Python 环境
+        
+        ### 📋 系统要求
+        
+        - **Windows**: Windows 10 或更高版本
+        - **macOS**: macOS 10.14 或更高版本
+        - **Linux**: 支持 glibc 2.17+ 的发行版
+        
+        ### 🔧 安装说明
+        
+        1. 下载对应平台的可执行文件
+        2. Windows/Linux: 直接运行可执行文件
+        3. macOS: 挂载 DMG 文件并拖拽到应用程序文件夹
+        
+        ### ⚠️ 注意事项
+        
+        - 首次运行可能需要较长时间进行初始化
+        - 如遇到安全警告，请在系统设置中允许运行
+        - 建议在运行前关闭杀毒软件的实时保护
+        
+        EOF
+
+    # 创建 GitHub Release
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        name: TimeNest ${{ steps.get_version.outputs.version }}
+        body_path: release_notes.md
+        draft: false
+        prerelease: ${{ contains(steps.get_version.outputs.version, 'alpha') || contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'rc') }}
+        files: |
+          ./artifacts/windows/*
+          ./artifacts/macos/*
+          ./artifacts/linux/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # 清理构建缓存（可选）
+    - name: Cleanup
+      run: |
+        echo "Release created successfully!"
+        echo "Download URLs will be available at: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.version }}"
